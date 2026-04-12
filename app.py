@@ -32,12 +32,9 @@ import bisect
 from dataclasses import dataclass
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Tuple, Optional
-
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 import io
-import math
 import zipfile
 import tempfile
 from pathlib import Path
@@ -2822,9 +2819,6 @@ def build_export_bundle(
 # =========================================================
 # CORE COMPUTE
 # =========================================================
-# =========================================================
-# CORE COMPUTE
-# =========================================================
 def compute_reinforcement_detailed(payload: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     data = normalize_frontend_payload(payload)
     geometry = data["geometry"]
@@ -2845,10 +2839,19 @@ def compute_reinforcement_detailed(payload: Any) -> Tuple[Dict[str, Any], Dict[s
     }
 
     min_beam_height_by_qtop = build_global_min_beam_height_by_qtop(geometry)
+
     forced_Ybase = build_global_unique_y_primary(
         geometry=geometry,
         min_beam_height_by_qtop=min_beam_height_by_qtop,
         clear_cm=clear_cm,
+    )
+
+    forced_Ysec = build_global_unique_y_secondary(
+        geometry=geometry,
+        min_beam_height_by_qtop=min_beam_height_by_qtop,
+        clear_cm=clear_cm,
+        distf_cm=distf_cm,
+        forced_Ybase=forced_Ybase,
     )
 
     df_all, panels_cache, reinf_cache = build_all_systems_table(
@@ -2859,6 +2862,7 @@ def compute_reinforcement_detailed(payload: Any) -> Tuple[Dict[str, Any], Dict[s
         clear_cm=clear_cm,
         distf_cm=distf_cm,
         forced_Ybase=forced_Ybase,
+        forced_Ysec=forced_Ysec,
     )
 
     df_valid, best_system = select_final_system(df_all)
@@ -2900,7 +2904,6 @@ def compute_reinforcement_detailed(payload: Any) -> Tuple[Dict[str, Any], Dict[s
     }
 
     return output_json, export_ctx
-
 
 def compute_reinforcement(payload: Any) -> Dict[str, Any]:
     output_json, _export_ctx = compute_reinforcement_detailed(payload)
