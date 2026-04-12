@@ -36,6 +36,29 @@ from typing import Any, Dict, List, Tuple, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+import io
+import math
+import zipfile
+import tempfile
+from pathlib import Path
+from io import BytesIO
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import cm
+from reportlab.pdfgen import canvas
+
+try:
+    import ezdxf
+except ImportError:
+    ezdxf = None
+
 # =========================================================
 # APP
 # =========================================================
@@ -119,6 +142,10 @@ DIAGONAL_COEFFS = {
         },
     },
 }
+
+FONT_REG = "Helvetica"
+FONT_BOLD = "Helvetica-Bold"
+EXPORT_FACADE_GAP_CM = 150.0
 
 # =========================================================
 # MODELS
@@ -2155,11 +2182,650 @@ def build_output_json(
         },
     }
 
+# =========================================================
+# EXPORT HELPERS - PDF / DXF / ZIP
+# =========================================================
+def _footer_pdf(c: canvas.Canvas, W, H):
+    h5 = H / 15
+    c.setFont(FONT_REG, 11)
+    c.drawCentredString(W / 2, 0.75 * h5, "Ing. Alessandro Bordini")
+    c.drawCentredString(W / 2, 0.35 * h5, "Phone: 3451604706 - alessandro_bordini@outlook.com")
+
+
+def _header_pdf(c: canvas.Canvas, W, H, title: str, subtitle_lines: List[str]):
+    c.setFont(FONT_BOLD, 14)
+    c.drawCentredString(W / 2, H - 0.75 * cm, title)
+
+    c.setFont(FONT_REG, 10)
+    y = H - 1.35 * cm
+    for ln in subtitle_lines:
+        c.drawCentredString(W / 2, y, ln)
+        y -= 0.45 * cm
+
+
+def _save_current_figure_to_png(path: Path, dpi: int = 220):
+    plt.tight_layout()
+    plt.savefig(path, dpi=dpi, bbox_inches="tight")
+    plt.close()
+
+
+def _panel_label_position(cols, beams, i, j):
+    x1 = cols[j].x_axis / 100.0
+    x2 = cols[j + 1].x_axis / 100.0
+    y1 = beams[i].y_axis / 100.0
+    y2 = beams[i + 1].y_axis / 100.0
+    return (0.5 * (x1 + x2), 0.5 * (y1 + y2))
+
+
+def plot_facade_reinforcement_png(
+    facade: Dict[str, Any],
+    reinforcement: Dict[str, Any],
+    out_path: Path,
+    panel_labels: bool = True,
+):
+    global_levels = facade.get("_global_levels_for_plot", [])
+    total_height = get_total_height(global_levels, DEFAULT_LAST_HEIGHT) if global_levels else (
+        max((b["y_top"] for b in reinforcement["beam_bands"]), default=0.0)
+    )
+
+    fig, ax = plt.subplots(figsize=(11, 5.8))
+    idx = facade["index"]
+
+    title = (
+        f"Facciata {idx} | start=({facade['start']['x']:.3f}, {facade['start']['y']:.3f}) "
+        f"| end=({facade['end']['x']:.3f}, {facade['end']['y']:.3f}) "
+        f"| L={facade['length_m']:.3f} m | orient={facade.get('orientation_deg', 0)}°"
+    )
+    ax.set_title(title)
+    ax.set_xlabel("Ascissa locale facciata [m]")
+    ax.set_ylabel("Quota [m]")
+
+    # outline facciata
+    ax.add_patch(
+        plt.Rectangle((0, 0), float(facade["length_m"]), total_height, fill=False, linewidth=1.3, edgecolor="black")
+    )
+
+    # livelli globali
+    for lvl in global_levels:
+        z = get_level_top(lvl, DEFAULT_LAST_HEIGHT)
+        ax.axhline(z, linewidth=0.6, linestyle=":", alpha=0.35, color="black")
+
+    # pilastrate
+    for band in reinforcement["pilastrate_bands"]:
+        ax.add_patch(
+            plt.Rectangle(
+                (band["x_left"], band["y_bottom"]),
+                band["width"],
+                band["height"],
+                fill=False,
+                linewidth=1.0,
+                edgecolor="black",
+            )
+        )
+
+    # travi continue
+    for band in reinforcement["beam_bands"]:
+        ax.add_patch(
+            plt.Rectangle(
+                (band["x_left"], band["y_bottom"]),
+                band["x_right"] - band["x_left"],
+                band["y_top"] - band["y_bottom"],
+                fill=False,
+                linewidth=0.9,
+                linestyle="--",
+                edgecolor="black",
+            )
+        )
+
+    # aperture
+    for lvl in facade.get("levels", []):
+        q_base = get_level_bottom(lvl, DEFAULT_LAST_HEIGHT)
+        for op in lvl.get("openings", []):
+            width_m, height_m, sill_m = get_opening_geometry(op)
+            x_left = float(op["distance_along_facade_m"]) - width_m / 2.0
+            y_bottom = q_base + sill_m
+            ax.add_patch(
+                plt.Rectangle(
+                    (x_left, y_bottom),
+                    width_m,
+                    height_m,
+                    fill=False,
+                    linewidth=1.1,
+                    edgecolor="black",
+                )
+            )
+
+    # assi strutturali
+    for band in reinforcement["pilastrate_bands"]:
+        ax.axvline(band["x_center"], linewidth=0.5, alpha=0.20, color="black")
+    for band in reinforcement["beam_bands"]:
+        ax.axhline(band["y_center"], linewidth=0.5, alpha=0.20, color="black")
+
+    # rinforzo in blu
+    for x_cm, y1_cm, y2_cm in reinforcement["v_segs"]:
+        ax.plot([x_cm / 100.0, x_cm / 100.0], [y1_cm / 100.0, y2_cm / 100.0], color="blue", linewidth=1.4)
+
+    for y_cm, x1_cm, x2_cm in reinforcement["h_segs"]:
+        ax.plot([x1_cm / 100.0, x2_cm / 100.0], [y_cm / 100.0, y_cm / 100.0], color="blue", linewidth=1.4)
+
+    for x1_cm, y1_cm, x2_cm, y2_cm in reinforcement["d_segs"]:
+        ax.plot([x1_cm / 100.0, x2_cm / 100.0], [y1_cm / 100.0, y2_cm / 100.0], color="blue", linewidth=1.1)
+
+    # label tamponamenti
+    if panel_labels:
+        cols = reinforcement["cols"]
+        beams = reinforcement["beams"]
+        for i in range(len(beams) - 1):
+            for j in range(len(cols) - 1):
+                xc, yc = _panel_label_position(cols, beams, i, j)
+                tag = f"F{idx}_P{i+1}_C{j+1}"
+                ax.text(xc, yc, tag, fontsize=8, ha="center", va="center", color="black")
+
+    margin_x = max(0.30, 0.05 * max(float(facade["length_m"]), 1.0))
+    ax.set_xlim(-margin_x, float(facade["length_m"]) + margin_x)
+    ax.set_ylim(-0.2, total_height + 0.5)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.22)
+
+    _save_current_figure_to_png(out_path)
+
+
+def build_panel_summary_rows(
+    geometry: Dict[str, Any],
+    best_system: Dict[str, Any],
+    panels_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    diag_key = best_system["diagonale"]
+    diag_label = DIAGONAL_LABEL[diag_key]
+
+    out = []
+    for row in panels_rows:
+        H_cm = float(row["H [cm]"])
+        B_cm = float(row["B [cm]"])
+        Pm_cm = float(row["Pm [cm]"])
+        ratio = float(row["ratio"])
+
+        bil = build_bilinear_for_panel(
+            H_cm=H_cm,
+            B_cm=B_cm,
+            Pm_cm=Pm_cm,
+            diagonale_tipo=diag_label,
+            ratio=ratio,
+        )
+
+        pos = bil["positivo"]
+        Kel = float(pos["Kel_ratio_kNmm"])
+        Fh_y = float(pos["Fy_ratio_kN"])
+        dHy = float(pos["dH_y_ratio_mm"])
+        dHu = float(pos["dH_u_ratio_mm"])
+        Kel_eq = Fh_y / dHu if abs(dHu) > EPS else 0.0
+
+        out.append({
+            "Tamponamento": row["Tamponamento"],
+            "Facciata": row["Facciata"],
+            "Piano": row["Piano"],
+            "Campata": row["Campata"],
+            "Pm_cm": Pm_cm,
+            "ratio": ratio,
+            "Kel_kNmm": Kel,
+            "Fh_y_kN": Fh_y,
+            "dHy_mm": dHy,
+            "dHu_mm": dHu,
+            "Kel_eq_kNmm": Kel_eq,
+            "diagonale": best_system["diagonale"],
+            "famiglia": best_system["famiglia"],
+        })
+    return out
+
+
+def combine_directional_panels_series_parallel_detailed(df_dir_panels: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not df_dir_panels:
+        return {
+            "K_MDOF [N/mm]": 0.0,
+            "Fy_MDOF [kN]": 0.0,
+            "floor_rows": [],
+            "frameK_rows": [],
+            "bay_rows": [],
+            "frameF_rows": [],
+        }
+
+    floor_group = defaultdict(list)
+    for row in df_dir_panels:
+        floor_group[(row["FrameKey"], row["Piano"])].append(row)
+
+    floor_rows = []
+    for (frame_key, piano), sub in floor_group.items():
+        K_floor = safe_parallel_sum([r["K_panel_dir [N/mm]"] for r in sub])
+        floor_rows.append({
+            "FrameKey": frame_key,
+            "Piano": int(piano),
+            "K_floor_parallel [N/mm]": K_floor,
+            "Panels": [r["Tamponamento"] for r in sub],
+        })
+
+    frame_group_K = defaultdict(list)
+    for row in floor_rows:
+        frame_group_K[row["FrameKey"]].append(row["K_floor_parallel [N/mm]"])
+
+    frameK_rows = []
+    for frame_key, values in frame_group_K.items():
+        K_frame = safe_series_sum(values)
+        frameK_rows.append({
+            "FrameKey": frame_key,
+            "K_frame [N/mm]": K_frame,
+        })
+
+    bay_group = defaultdict(list)
+    for row in df_dir_panels:
+        bay_group[(row["FrameKey"], row["Campata"])].append(row["Fy_panel_dir [kN]"])
+
+    bay_rows = []
+    for (frame_key, campata), values in bay_group.items():
+        Fy_bay = safe_mean(values)
+        bay_rows.append({
+            "FrameKey": frame_key,
+            "Campata": int(campata),
+            "Fy_bay_mean [kN]": Fy_bay,
+        })
+
+    frame_group_F = defaultdict(list)
+    for row in bay_rows:
+        frame_group_F[row["FrameKey"]].append(row["Fy_bay_mean [kN]"])
+
+    frameF_rows = []
+    for frame_key, values in frame_group_F.items():
+        Fy_frame = safe_parallel_sum(values)
+        frameF_rows.append({
+            "FrameKey": frame_key,
+            "Fy_frame [kN]": Fy_frame,
+        })
+
+    K_R = safe_parallel_sum([r["K_frame [N/mm]"] for r in frameK_rows]) if frameK_rows else 0.0
+    Fy_R = safe_parallel_sum([r["Fy_frame [kN]"] for r in frameF_rows]) if frameF_rows else 0.0
+
+    return {
+        "K_MDOF [N/mm]": float(K_R),
+        "Fy_MDOF [kN]": float(Fy_R),
+        "floor_rows": floor_rows,
+        "frameK_rows": frameK_rows,
+        "bay_rows": bay_rows,
+        "frameF_rows": frameF_rows,
+    }
+
+
+def build_directional_report_data(
+    geometry: Dict[str, Any],
+    modal: Dict[str, Any],
+    deltaK_targets: Dict[str, float],
+    df_real_panels: List[Dict[str, Any]],
+    diag_key: str,
+) -> Dict[str, Any]:
+    directions = ["+X", "-X", "+Y", "-Y"]
+    out = {}
+
+    for direction in directions:
+        axis, _branch = direction_to_axis_and_branch(direction)
+        df_dir = build_directional_panel_dataframe(
+            df_panels=df_real_panels,
+            geometry=geometry,
+            direction=direction,
+            diag_key=diag_key,
+        )
+        comb = combine_directional_panels_series_parallel_detailed(df_dir)
+
+        deltaK_real_kNmm = comb["K_MDOF [N/mm]"] / 1000.0
+        Fy_MDOF = comb["Fy_MDOF [kN]"]
+
+        gamma = float(modal[axis]["gamma"])
+        mstar_ton = float(modal[axis]["Mstar"])
+
+        target = float(deltaK_targets[direction])
+        verifica = deltaK_real_kNmm >= target - 1e-12
+
+        out[direction] = {
+            "axis": axis,
+            "target_deltaK": target,
+            "deltaK_real_MDOF": deltaK_real_kNmm,
+            "Fy_MDOF": Fy_MDOF,
+            "deltaK_1GDL_g_per_mm": convert_real_deltaK_to_sdf(deltaK_real_kNmm, gamma, mstar_ton),
+            "Se_g": convert_real_force_to_sdf(Fy_MDOF, gamma, mstar_ton)["Se_g"],
+            "verificato": bool(verifica),
+            "floor_rows": comb["floor_rows"],
+            "frameK_rows": comb["frameK_rows"],
+            "bay_rows": comb["bay_rows"],
+            "frameF_rows": comb["frameF_rows"],
+        }
+    return out
+
+
+def render_pdf_report(
+    pdf_path: Path,
+    geometry: Dict[str, Any],
+    reinf_by_facade: Dict[int, Dict[str, Any]],
+    best_system: Dict[str, Any],
+    panel_summary_rows: List[Dict[str, Any]],
+    directional_report: Dict[str, Any],
+):
+    W, H = A4
+    c = canvas.Canvas(str(pdf_path), pagesize=A4)
+
+    subtitle_lines = [
+        f"Sistema scelto: famiglia {best_system['famiglia']} | diagonale {best_system['diagonale']}",
+        "Report automatico rinforzo tamponamenti",
+    ]
+
+    # -----------------------------------------------------------------
+    # PAGINE FACCIATE - 2 PER PAGINA
+    # -----------------------------------------------------------------
+    facades = geometry["facades"]
+    tmp_dir = pdf_path.parent / "_tmp_pdf_imgs"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    facade_pngs = []
+    for facade in facades:
+        idx = int(facade["index"])
+        facade["_global_levels_for_plot"] = geometry["levels"]
+        png_path = tmp_dir / f"facciata_{idx}.png"
+        plot_facade_reinforcement_png(
+            facade=facade,
+            reinforcement=reinf_by_facade[idx],
+            out_path=png_path,
+            panel_labels=True,
+        )
+        facade_pngs.append((idx, png_path))
+
+    for start in range(0, len(facade_pngs), 2):
+        _header_pdf(c, W, H, "Schema di rinforzo per facciata", subtitle_lines)
+
+        y_top_1 = H - 3.0 * cm
+        box_h = 10.7 * cm
+        box_w = W - 2.0 * cm
+
+        for local_k, (idx, img_path) in enumerate(facade_pngs[start:start+2]):
+            y_top = y_top_1 - local_k * (box_h + 0.8 * cm)
+            c.setFont(FONT_BOLD, 11)
+            c.drawString(1.1 * cm, y_top + 0.25 * cm, f"Facciata {idx}")
+
+            c.drawImage(
+                str(img_path),
+                1.0 * cm,
+                y_top - box_h,
+                width=box_w,
+                height=box_h,
+                preserveAspectRatio=True,
+                mask="auto",
+            )
+
+        _footer_pdf(c, W, H)
+        c.showPage()
+
+    # -----------------------------------------------------------------
+    # PAGINE RIASSUNTO TAMPONAMENTI
+    # -----------------------------------------------------------------
+    _header_pdf(c, W, H, "Riepilogo tamponamento per tamponamento", subtitle_lines)
+    c.setFont(FONT_BOLD, 10)
+    y = H - 2.5 * cm
+    headers = ["Tag", "Pm [cm]", "Kel", "Fh_y", "dHy", "dHu", "Kel_eq"]
+    xs = [1.0*cm, 5.2*cm, 7.0*cm, 9.0*cm, 11.2*cm, 13.0*cm, 15.2*cm]
+    for xx, hh in zip(xs, headers):
+        c.drawString(xx, y, hh)
+    y -= 0.35 * cm
+    c.line(0.9 * cm, y, W - 0.9 * cm, y)
+    y -= 0.35 * cm
+    c.setFont(FONT_REG, 8.5)
+
+    for row in panel_summary_rows:
+        if y < 1.8 * cm:
+            _footer_pdf(c, W, H)
+            c.showPage()
+            _header_pdf(c, W, H, "Riepilogo tamponamento per tamponamento", subtitle_lines)
+            c.setFont(FONT_BOLD, 10)
+            y = H - 2.5 * cm
+            for xx, hh in zip(xs, headers):
+                c.drawString(xx, y, hh)
+            y -= 0.35 * cm
+            c.line(0.9 * cm, y, W - 0.9 * cm, y)
+            y -= 0.35 * cm
+            c.setFont(FONT_REG, 8.5)
+
+        vals = [
+            row["Tamponamento"],
+            f"{row['Pm_cm']:.1f}",
+            f"{row['Kel_kNmm']:.1f}",
+            f"{row['Fh_y_kN']:.1f}",
+            f"{row['dHy_mm']:.1f}",
+            f"{row['dHu_mm']:.1f}",
+            f"{row['Kel_eq_kNmm']:.3f}",
+        ]
+        for xx, vv in zip(xs, vals):
+            c.drawString(xx, y, vv)
+        y -= 0.33 * cm
+
+    _footer_pdf(c, W, H)
+    c.showPage()
+
+    # -----------------------------------------------------------------
+    # PAGINE DIREZIONALI
+    # -----------------------------------------------------------------
+    for direction in ["+X", "-X", "+Y", "-Y"]:
+        dd = directional_report[direction]
+        _header_pdf(c, W, H, f"Direzione {direction}", subtitle_lines)
+
+        y = H - 2.3 * cm
+        c.setFont(FONT_BOLD, 11)
+        c.drawString(1.2 * cm, y, "Combinazioni in parallelo per piano")
+        y -= 0.45 * cm
+        c.setFont(FONT_REG, 9)
+        for rr in dd["floor_rows"]:
+            txt = (
+                f"Frame {rr['FrameKey']} | Piano {rr['Piano']} | "
+                f"K_floor = {rr['K_floor_parallel [N/mm]']:.2f} N/mm | "
+                f"Panels: {', '.join(rr['Panels'])}"
+            )
+            if y < 2.0 * cm:
+                _footer_pdf(c, W, H)
+                c.showPage()
+                _header_pdf(c, W, H, f"Direzione {direction}", subtitle_lines)
+                y = H - 2.3 * cm
+            c.drawString(1.2 * cm, y, txt[:140])
+            y -= 0.38 * cm
+
+        y -= 0.20 * cm
+        c.setFont(FONT_BOLD, 11)
+        c.drawString(1.2 * cm, y, "Combinazioni in serie dei frame")
+        y -= 0.45 * cm
+        c.setFont(FONT_REG, 9)
+        for rr in dd["frameK_rows"]:
+            txt = f"Frame {rr['FrameKey']} | K_frame = {rr['K_frame [N/mm]']:.2f} N/mm"
+            if y < 2.0 * cm:
+                _footer_pdf(c, W, H)
+                c.showPage()
+                _header_pdf(c, W, H, f"Direzione {direction}", subtitle_lines)
+                y = H - 2.3 * cm
+            c.drawString(1.2 * cm, y, txt)
+            y -= 0.38 * cm
+
+        y -= 0.20 * cm
+        c.setFont(FONT_BOLD, 11)
+        c.drawString(1.2 * cm, y, "Resistenze per campata e frame")
+        y -= 0.45 * cm
+        c.setFont(FONT_REG, 9)
+        for rr in dd["bay_rows"]:
+            txt = f"Frame {rr['FrameKey']} | Campata {rr['Campata']} | Fy_bay_mean = {rr['Fy_bay_mean [kN]']:.2f} kN"
+            if y < 2.0 * cm:
+                _footer_pdf(c, W, H)
+                c.showPage()
+                _header_pdf(c, W, H, f"Direzione {direction}", subtitle_lines)
+                y = H - 2.3 * cm
+            c.drawString(1.2 * cm, y, txt)
+            y -= 0.38 * cm
+
+        for rr in dd["frameF_rows"]:
+            txt = f"Frame {rr['FrameKey']} | Fy_frame = {rr['Fy_frame [kN]']:.2f} kN"
+            if y < 2.0 * cm:
+                _footer_pdf(c, W, H)
+                c.showPage()
+                _header_pdf(c, W, H, f"Direzione {direction}", subtitle_lines)
+                y = H - 2.3 * cm
+            c.drawString(1.2 * cm, y, txt)
+            y -= 0.38 * cm
+
+        y -= 0.35 * cm
+        c.setFont(FONT_BOLD, 11)
+        c.drawString(1.2 * cm, y, f"Delta_K richiesto = {dd['target_deltaK']:.3f} kN/mm")
+        y -= 0.45 * cm
+        c.drawString(1.2 * cm, y, f"Delta_K ottenuto = {dd['deltaK_real_MDOF']:.3f} kN/mm")
+        y -= 0.45 * cm
+        c.drawString(1.2 * cm, y, f"Fy ottenuto = {dd['Fy_MDOF']:.3f} kN")
+        y -= 0.45 * cm
+        c.drawString(1.2 * cm, y, f"Esito = {'VERIFICATO' if dd['verificato'] else 'NON VERIFICATO'}")
+
+        _footer_pdf(c, W, H)
+        c.showPage()
+
+    c.save()
+
+
+def export_multi_facade_dxf(
+    dxf_path: Path,
+    geometry: Dict[str, Any],
+    reinf_by_facade: Dict[int, Dict[str, Any]],
+):
+    if ezdxf is None:
+        raise RuntimeError("Modulo ezdxf non installato. Aggiungilo al requirements.txt")
+
+    doc = ezdxf.new(setup=True)
+    msp = doc.modelspace()
+
+    for layer_name, color in [
+        ("STRUCTURE", 7),
+        ("OPENINGS", 5),
+        ("REINF", 1),
+        ("AXES_REAL", 3),
+        ("TITLES", 2),
+    ]:
+        if layer_name not in doc.layers:
+            doc.layers.new(layer_name, dxfattribs={"color": color})
+
+    x_offset = 0.0
+
+    for facade in geometry["facades"]:
+        idx = int(facade["index"])
+        reinforcement = reinf_by_facade[idx]
+        L_cm = float(facade["length_m"]) * 100.0
+        total_height_cm = get_total_height(geometry["levels"], DEFAULT_LAST_HEIGHT) * 100.0
+
+        # titolo
+        msp.add_text(
+            f"FACCIATA {idx}",
+            dxfattribs={"layer": "TITLES", "height": 18}
+        ).set_placement((x_offset, total_height_cm + 40))
+
+        # contorno facciata
+        pts = [
+            (x_offset + 0, 0),
+            (x_offset + L_cm, 0),
+            (x_offset + L_cm, total_height_cm),
+            (x_offset + 0, total_height_cm),
+            (x_offset + 0, 0),
+        ]
+        msp.add_lwpolyline(pts, dxfattribs={"layer": "STRUCTURE"})
+
+        # pilastrate e assi reali
+        for col in reinforcement["cols"]:
+            xc = x_offset + col.x_axis
+            x1 = xc - col.spess / 2.0
+            x2 = xc + col.spess / 2.0
+            msp.add_lwpolyline(
+                [(x1, 0), (x2, 0), (x2, total_height_cm), (x1, total_height_cm), (x1, 0)],
+                dxfattribs={"layer": "STRUCTURE"},
+            )
+            msp.add_line((xc, 0), (xc, total_height_cm), dxfattribs={"layer": "AXES_REAL"})
+
+        # travi
+        for beam in reinforcement["beams"]:
+            yc = beam.y_axis
+            y1 = yc - beam.spess / 2.0
+            y2 = yc + beam.spess / 2.0
+            msp.add_lwpolyline(
+                [(x_offset, y1), (x_offset + L_cm, y1), (x_offset + L_cm, y2), (x_offset, y2), (x_offset, y1)],
+                dxfattribs={"layer": "STRUCTURE"},
+            )
+
+        # aperture
+        for lvl in facade.get("levels", []):
+            q_base = get_level_bottom(lvl, DEFAULT_LAST_HEIGHT)
+            for op in lvl.get("openings", []):
+                width_m, height_m, sill_m = get_opening_geometry(op)
+                x_left_cm = (float(op["distance_along_facade_m"]) - width_m / 2.0) * 100.0
+                y_bottom_cm = (q_base + sill_m) * 100.0
+                w_cm = width_m * 100.0
+                h_cm = height_m * 100.0
+                msp.add_lwpolyline(
+                    [
+                        (x_offset + x_left_cm, y_bottom_cm),
+                        (x_offset + x_left_cm + w_cm, y_bottom_cm),
+                        (x_offset + x_left_cm + w_cm, y_bottom_cm + h_cm),
+                        (x_offset + x_left_cm, y_bottom_cm + h_cm),
+                        (x_offset + x_left_cm, y_bottom_cm),
+                    ],
+                    dxfattribs={"layer": "OPENINGS"},
+                )
+
+        # rinforzo
+        for x_cm, y1_cm, y2_cm in reinforcement["v_segs"]:
+            msp.add_line((x_offset + x_cm, y1_cm), (x_offset + x_cm, y2_cm), dxfattribs={"layer": "REINF"})
+        for y_cm, x1_cm, x2_cm in reinforcement["h_segs"]:
+            msp.add_line((x_offset + x1_cm, y_cm), (x_offset + x2_cm, y_cm), dxfattribs={"layer": "REINF"})
+        for x1_cm, y1_cm, x2_cm, y2_cm in reinforcement["d_segs"]:
+            msp.add_line((x_offset + x1_cm, y1_cm), (x_offset + x2_cm, y2_cm), dxfattribs={"layer": "REINF"})
+
+        x_offset += L_cm + EXPORT_FACADE_GAP_CM
+
+    doc.saveas(str(dxf_path))
+
+
+def build_export_bundle(
+    payload: Any,
+    output_json: Dict[str, Any],
+    export_ctx: Dict[str, Any],
+) -> BytesIO:
+    with tempfile.TemporaryDirectory(prefix="muratura_export_") as tmp:
+        tmp_dir = Path(tmp)
+
+        pdf_path = tmp_dir / "Report_Rinforzo_Tamponamenti.pdf"
+        dxf_path = tmp_dir / "Schema_Rinforzo_Facciate.dxf"
+
+        render_pdf_report(
+            pdf_path=pdf_path,
+            geometry=export_ctx["geometry"],
+            reinf_by_facade=export_ctx["reinf_by_facade"],
+            best_system=export_ctx["best_system"],
+            panel_summary_rows=export_ctx["panel_summary_rows"],
+            directional_report=export_ctx["directional_report"],
+        )
+
+        export_multi_facade_dxf(
+            dxf_path=dxf_path,
+            geometry=export_ctx["geometry"],
+            reinf_by_facade=export_ctx["reinf_by_facade"],
+        )
+
+        mem = BytesIO()
+        with zipfile.ZipFile(mem, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(pdf_path, arcname=pdf_path.name)
+            zf.write(dxf_path, arcname=dxf_path.name)
+
+        mem.seek(0)
+        return mem
 
 # =========================================================
 # CORE COMPUTE
 # =========================================================
-def compute_reinforcement(payload: Any) -> Dict[str, Any]:
+# =========================================================
+# CORE COMPUTE
+# =========================================================
+def compute_reinforcement_detailed(payload: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     data = normalize_frontend_payload(payload)
     geometry = data["geometry"]
     deltaK = data["deltaK"]
@@ -2179,22 +2845,13 @@ def compute_reinforcement(payload: Any) -> Dict[str, Any]:
     }
 
     min_beam_height_by_qtop = build_global_min_beam_height_by_qtop(geometry)
-
     forced_Ybase = build_global_unique_y_primary(
         geometry=geometry,
         min_beam_height_by_qtop=min_beam_height_by_qtop,
         clear_cm=clear_cm,
     )
 
-    forced_Ysec = build_global_unique_y_secondary(
-        geometry=geometry,
-        min_beam_height_by_qtop=min_beam_height_by_qtop,
-        clear_cm=clear_cm,
-        distf_cm=distf_cm,
-        forced_Ybase=forced_Ybase,
-    )
-
-    df_all, _panels_cache, reinf_cache = build_all_systems_table(
+    df_all, panels_cache, reinf_cache = build_all_systems_table(
         geometry=geometry,
         modal=modal,
         deltaK_targets=deltaK_targets,
@@ -2202,13 +2859,13 @@ def compute_reinforcement(payload: Any) -> Dict[str, Any]:
         clear_cm=clear_cm,
         distf_cm=distf_cm,
         forced_Ybase=forced_Ybase,
-        forced_Ysec=forced_Ysec,
     )
 
     df_valid, best_system = select_final_system(df_all)
 
     final_family = best_system["famiglia"]
     final_reinf_by_facade = reinf_cache[final_family]
+    final_panels_rows = panels_cache[final_family]
 
     output_json = build_output_json(
         deltaK_targets=deltaK_targets,
@@ -2220,9 +2877,37 @@ def compute_reinforcement(payload: Any) -> Dict[str, Any]:
         geometry=geometry,
     )
 
+    panel_summary_rows = build_panel_summary_rows(
+        geometry=geometry,
+        best_system=best_system,
+        panels_rows=final_panels_rows,
+    )
+
+    directional_report = build_directional_report_data(
+        geometry=geometry,
+        modal=modal,
+        deltaK_targets=deltaK_targets,
+        df_real_panels=final_panels_rows,
+        diag_key=best_system["diagonale"],
+    )
+
+    export_ctx = {
+        "geometry": geometry,
+        "best_system": best_system,
+        "reinf_by_facade": final_reinf_by_facade,
+        "panel_summary_rows": panel_summary_rows,
+        "directional_report": directional_report,
+    }
+
+    return output_json, export_ctx
+
+
+def compute_reinforcement(payload: Any) -> Dict[str, Any]:
+    output_json, _export_ctx = compute_reinforcement_detailed(payload)
     return output_json
-
-
+# =========================================================
+# ENDPOINTS
+# =========================================================
 # =========================================================
 # ENDPOINTS
 # =========================================================
@@ -2236,13 +2921,30 @@ def health():
 
 
 @app.post("/compute")
-def compute(req: ComputeRequest):
+def compute(
+    req: ComputeRequest,
+    create_bundle: bool = Query(default=False, description="Se true restituisce ZIP con PDF + DXF"),
+):
     try:
-        result = compute_reinforcement(req.payload)
-        return result
+        result, export_ctx = compute_reinforcement_detailed(req.payload)
+
+        if not create_bundle:
+            return result
+
+        zip_buffer = build_export_bundle(
+            payload=req.payload,
+            output_json=result,
+            export_ctx=export_ctx,
+        )
+
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers={"Content-Disposition": 'attachment; filename="rinforzo_tamponamenti_export.zip"'},
+        )
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 
 # =========================================================
 # NOTE DEPLOY

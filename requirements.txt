@@ -1,3 +1,7 @@
 fastapi
 uvicorn[standard]
 pydantic
+matplotlib
+reportlab
+ezdxf
+numpy
