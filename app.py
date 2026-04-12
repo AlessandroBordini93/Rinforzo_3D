@@ -32,9 +32,12 @@ import bisect
 from dataclasses import dataclass
 from collections import defaultdict, deque
 from typing import Any, Dict, List, Tuple, Optional
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 import io
+import math
 import zipfile
 import tempfile
 from pathlib import Path
@@ -1566,7 +1569,6 @@ def _calc_diag_formula(p_d_mm: float, H_d_cm: float, B_d_cm: float, coeff: Dict[
 
     return a_s * (p_d_mm ** b_s) * ((H_d_cm / B_d_cm) ** c_s)
 
-
 def build_bilinear_for_panel(H_cm: float, B_cm: float, Pm_cm: float, diagonale_tipo: str, ratio: float = 1.0) -> Dict[str, Any]:
     coeffs = DIAGONAL_COEFFS[diagonale_tipo]
     p_d_mm = Pm_cm * 10.0
@@ -1582,15 +1584,36 @@ def build_bilinear_for_panel(H_cm: float, B_cm: float, Pm_cm: float, diagonale_t
 
         Fy_kN = Fh_y_Hd_kNmm * H_mm
         dH_u_mm = dHu_Hd * H_mm
-        dH_y_mm = Fy_kN / Kel_kNmm if abs(Kel_kNmm) > EPS else 0.0
-        if dH_u_mm > 0 and dH_y_mm > dH_u_mm:
+
+        dH_y_teorico_mm = Fy_kN / Kel_kNmm if abs(Kel_kNmm) > EPS else 0.0
+
+        truncated_to_ultimate = False
+        if dH_u_mm > 0 and dH_y_teorico_mm > dH_u_mm:
             dH_y_mm = dH_u_mm
+            truncated_to_ultimate = True
+        else:
+            dH_y_mm = dH_y_teorico_mm
+
+        Kel_ratio = Kel_kNmm * ratio
+        Fy_ratio = Fy_kN * ratio
+        dHy_ratio = dH_y_mm
+        dHu_ratio = dH_u_mm
+
+        # REGOLA NUOVA:
+        # se il modello viene troncato a dHu, allora Keleq = Kel
+        if truncated_to_ultimate:
+            Kel_eq_ratio = Kel_ratio
+        else:
+            Kel_eq_ratio = Fy_ratio / dHu_ratio if abs(dHu_ratio) > EPS else 0.0
 
         out[ramo] = {
-            "Kel_ratio_kNmm": Kel_kNmm * ratio,
-            "Fy_ratio_kN": Fy_kN * ratio,
-            "dH_y_ratio_mm": dH_y_mm,
-            "dH_u_ratio_mm": dH_u_mm,
+            "Kel_ratio_kNmm": Kel_ratio,
+            "Fy_ratio_kN": Fy_ratio,
+            "dH_y_ratio_mm": dHy_ratio,
+            "dH_u_ratio_mm": dHu_ratio,
+            "Kel_eq_ratio_kNmm": Kel_eq_ratio,
+            "dH_y_theoretical_mm": dH_y_teorico_mm,
+            "truncated_to_ultimate": truncated_to_ultimate,
         }
 
     return {
@@ -1598,7 +1621,6 @@ def build_bilinear_for_panel(H_cm: float, B_cm: float, Pm_cm: float, diagonale_t
         "positivo": out["POSITIVO"],
         "negativo": out["NEGATIVO"],
     }
-
 
 def project_local_panel_to_global_direction(K_local_Nmm: float, Fy_local_kN: float, facade: Dict[str, Any], axis: str) -> Tuple[float, float]:
     (tx, ty), (_nx, _ny) = get_facade_unit_vectors(facade)
@@ -2326,7 +2348,6 @@ def plot_facade_reinforcement_png(
 
     _save_current_figure_to_png(out_path)
 
-
 def build_panel_summary_rows(
     geometry: Dict[str, Any],
     best_system: Dict[str, Any],
@@ -2351,11 +2372,7 @@ def build_panel_summary_rows(
         )
 
         pos = bil["positivo"]
-        Kel = float(pos["Kel_ratio_kNmm"])
-        Fh_y = float(pos["Fy_ratio_kN"])
-        dHy = float(pos["dH_y_ratio_mm"])
-        dHu = float(pos["dH_u_ratio_mm"])
-        Kel_eq = Fh_y / dHu if abs(dHu) > EPS else 0.0
+        neg = bil["negativo"]
 
         out.append({
             "Tamponamento": row["Tamponamento"],
@@ -2364,16 +2381,25 @@ def build_panel_summary_rows(
             "Campata": row["Campata"],
             "Pm_cm": Pm_cm,
             "ratio": ratio,
-            "Kel_kNmm": Kel,
-            "Fh_y_kN": Fh_y,
-            "dHy_mm": dHy,
-            "dHu_mm": dHu,
-            "Kel_eq_kNmm": Kel_eq,
+
+            "Kel_pos_kNmm": float(pos["Kel_ratio_kNmm"]),
+            "Fh_y_pos_kN": float(pos["Fy_ratio_kN"]),
+            "dHy_pos_mm": float(pos["dH_y_ratio_mm"]),
+            "dHu_pos_mm": float(pos["dH_u_ratio_mm"]),
+            "Kel_eq_pos_kNmm": float(pos["Kel_eq_ratio_kNmm"]),
+            "trunc_pos": bool(pos.get("truncated_to_ultimate", False)),
+
+            "Kel_neg_kNmm": float(neg["Kel_ratio_kNmm"]),
+            "Fh_y_neg_kN": float(neg["Fy_ratio_kN"]),
+            "dHy_neg_mm": float(neg["dH_y_ratio_mm"]),
+            "dHu_neg_mm": float(neg["dH_u_ratio_mm"]),
+            "Kel_eq_neg_kNmm": float(neg["Kel_eq_ratio_kNmm"]),
+            "trunc_neg": bool(neg.get("truncated_to_ultimate", False)),
+
             "diagonale": best_system["diagonale"],
             "famiglia": best_system["famiglia"],
         })
     return out
-
 
 def combine_directional_panels_series_parallel_detailed(df_dir_panels: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not df_dir_panels:
@@ -2560,43 +2586,68 @@ def render_pdf_report(
     # PAGINE RIASSUNTO TAMPONAMENTI
     # -----------------------------------------------------------------
     _header_pdf(c, W, H, "Riepilogo tamponamento per tamponamento", subtitle_lines)
-    c.setFont(FONT_BOLD, 10)
-    y = H - 2.5 * cm
-    headers = ["Tag", "Pm [cm]", "Kel", "Fh_y", "dHy", "dHu", "Kel_eq"]
-    xs = [1.0*cm, 5.2*cm, 7.0*cm, 9.0*cm, 11.2*cm, 13.0*cm, 15.2*cm]
+    c.setFont(FONT_REG, 8.5)
+    y_note = H - 1.95 * cm
+    c.drawString(0.9 * cm, y_note, "Nota: se dHy teorico > dHu, il modello viene troncato a dHu e si assume Kel_eq = Kel.")
+    c.setFont(FONT_BOLD, 8.2)
+    y = H - 2.3 * cm
+
+    headers = [
+        "Tag", "Pm",
+        "Kel +", "Fh_y +", "dHy +", "dHu +", "Kel_eq +",
+        "Kel -", "Fh_y -", "dHy -", "dHu -", "Kel_eq -"
+    ]
+    xs = [
+        0.7*cm, 3.4*cm,
+        4.6*cm, 6.0*cm, 7.4*cm, 8.6*cm, 9.8*cm,
+        11.3*cm, 12.7*cm, 14.1*cm, 15.3*cm, 16.5*cm
+    ]
+
     for xx, hh in zip(xs, headers):
         c.drawString(xx, y, hh)
-    y -= 0.35 * cm
-    c.line(0.9 * cm, y, W - 0.9 * cm, y)
-    y -= 0.35 * cm
-    c.setFont(FONT_REG, 8.5)
+
+    y -= 0.30 * cm
+    c.line(0.6 * cm, y, W - 0.6 * cm, y)
+    y -= 0.28 * cm
+    c.setFont(FONT_REG, 7.0)
 
     for row in panel_summary_rows:
         if y < 1.8 * cm:
             _footer_pdf(c, W, H)
             c.showPage()
             _header_pdf(c, W, H, "Riepilogo tamponamento per tamponamento", subtitle_lines)
-            c.setFont(FONT_BOLD, 10)
-            y = H - 2.5 * cm
+            c.setFont(FONT_BOLD, 8.2)
+            y = H - 2.3 * cm
+
             for xx, hh in zip(xs, headers):
                 c.drawString(xx, y, hh)
-            y -= 0.35 * cm
-            c.line(0.9 * cm, y, W - 0.9 * cm, y)
-            y -= 0.35 * cm
-            c.setFont(FONT_REG, 8.5)
+
+            y -= 0.30 * cm
+            c.line(0.6 * cm, y, W - 0.6 * cm, y)
+            y -= 0.28 * cm
+            c.setFont(FONT_REG, 7.0)
 
         vals = [
             row["Tamponamento"],
             f"{row['Pm_cm']:.1f}",
-            f"{row['Kel_kNmm']:.1f}",
-            f"{row['Fh_y_kN']:.1f}",
-            f"{row['dHy_mm']:.1f}",
-            f"{row['dHu_mm']:.1f}",
-            f"{row['Kel_eq_kNmm']:.3f}",
+
+            f"{row['Kel_pos_kNmm']:.1f}",
+            f"{row['Fh_y_pos_kN']:.1f}",
+            f"{row['dHy_pos_mm']:.1f}",
+            f"{row['dHu_pos_mm']:.1f}",
+            f"{row['Kel_eq_pos_kNmm']:.3f}",
+
+            f"{row['Kel_neg_kNmm']:.1f}",
+            f"{row['Fh_y_neg_kN']:.1f}",
+            f"{row['dHy_neg_mm']:.1f}",
+            f"{row['dHu_neg_mm']:.1f}",
+            f"{row['Kel_eq_neg_kNmm']:.3f}",
         ]
+
         for xx, vv in zip(xs, vals):
             c.drawString(xx, y, vv)
-        y -= 0.33 * cm
+
+        y -= 0.28 * cm
 
     _footer_pdf(c, W, H)
     c.showPage()
@@ -2819,6 +2870,9 @@ def build_export_bundle(
 # =========================================================
 # CORE COMPUTE
 # =========================================================
+# =========================================================
+# CORE COMPUTE
+# =========================================================
 def compute_reinforcement_detailed(payload: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     data = normalize_frontend_payload(payload)
     geometry = data["geometry"]
@@ -2839,19 +2893,10 @@ def compute_reinforcement_detailed(payload: Any) -> Tuple[Dict[str, Any], Dict[s
     }
 
     min_beam_height_by_qtop = build_global_min_beam_height_by_qtop(geometry)
-
     forced_Ybase = build_global_unique_y_primary(
         geometry=geometry,
         min_beam_height_by_qtop=min_beam_height_by_qtop,
         clear_cm=clear_cm,
-    )
-
-    forced_Ysec = build_global_unique_y_secondary(
-        geometry=geometry,
-        min_beam_height_by_qtop=min_beam_height_by_qtop,
-        clear_cm=clear_cm,
-        distf_cm=distf_cm,
-        forced_Ybase=forced_Ybase,
     )
 
     df_all, panels_cache, reinf_cache = build_all_systems_table(
@@ -2862,7 +2907,6 @@ def compute_reinforcement_detailed(payload: Any) -> Tuple[Dict[str, Any], Dict[s
         clear_cm=clear_cm,
         distf_cm=distf_cm,
         forced_Ybase=forced_Ybase,
-        forced_Ysec=forced_Ysec,
     )
 
     df_valid, best_system = select_final_system(df_all)
@@ -2904,6 +2948,7 @@ def compute_reinforcement_detailed(payload: Any) -> Tuple[Dict[str, Any], Dict[s
     }
 
     return output_json, export_ctx
+
 
 def compute_reinforcement(payload: Any) -> Dict[str, Any]:
     output_json, _export_ctx = compute_reinforcement_detailed(payload)
