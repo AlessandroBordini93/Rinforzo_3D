@@ -18,11 +18,17 @@
 # - verifica su ΔK reale MDOF (+X, -X, +Y, -Y)
 # - export ADRS pulito: k_1GDL [g/mm], Se(Fy) [g]
 # - plotting disabilitato lato API
+# - AGGIUNTA: generazione linee secondarie completa
+#   * linee primarie
+#   * linee vicino aperture
+#   * riempimento intervalli con combinazione dei passi ammessi
+#     privilegiando passi grandi e usando 25 cm solo se necessario
 # =========================================================
 
 import math
+import bisect
 from dataclasses import dataclass
-from collections import defaultdict
+from collections import defaultdict, deque
 from typing import Any, Dict, List, Tuple, Optional
 
 from fastapi import FastAPI, HTTPException
@@ -33,7 +39,7 @@ from pydantic import BaseModel
 # =========================================================
 app = FastAPI(
     title="Muratura Reinforcement API",
-    version="1.0.0",
+    version="1.1.0",
     description="API per il calcolo del rinforzo dei tamponamenti murari da JSON front-end."
 )
 
@@ -534,7 +540,11 @@ def get_min_beam_height_for_qtop(q_top: float, min_beam_height_by_qtop: Dict[flo
     return None
 
 
-def build_continuous_beam_bands_for_facade(facade: Dict[str, Any], min_beam_height_by_qtop: Dict[float, float], pilastrate_bands: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_continuous_beam_bands_for_facade(
+    facade: Dict[str, Any],
+    min_beam_height_by_qtop: Dict[float, float],
+    pilastrate_bands: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
     facade_length = float(facade["length_m"])
 
     if pilastrate_bands:
@@ -618,7 +628,11 @@ def build_facade_opening_windows_R(facade: Dict[str, Any]) -> List[WindowR]:
     return windows
 
 
-def facade_to_reinforcement_model(facade: Dict[str, Any], global_levels: List[Dict[str, Any]], min_beam_height_by_qtop: Dict[float, float]) -> Dict[str, Any]:
+def facade_to_reinforcement_model(
+    facade: Dict[str, Any],
+    global_levels: List[Dict[str, Any]],
+    min_beam_height_by_qtop: Dict[float, float]
+) -> Dict[str, Any]:
     pilastrate_bands = build_vertical_pilastrate_for_facade(facade, global_levels)
     beam_bands = build_continuous_beam_bands_for_facade(
         facade=facade,
@@ -641,6 +655,133 @@ def facade_to_reinforcement_model(facade: Dict[str, Any], global_levels: List[Di
         "beams": beams,
         "windows": windows,
     }
+
+
+# =========================================================
+# LINEE VICINO APERTURE + FINESTRE GONFIATE CLAMPATE
+# =========================================================
+def _overlap_strict(a1: float, a2: float, b1: float, b2: float, eps: float = 1e-9) -> bool:
+    lo1, hi1 = (a1, a2) if a1 <= a2 else (a2, a1)
+    lo2, hi2 = (b1, b2) if b1 <= b2 else (b2, b1)
+    return not (hi1 <= lo2 + eps or hi2 <= lo1 + eps)
+
+
+def linee_finestre_candidate_driven(grid: List[float], wins_gonf: List[WindowR], asse: str, eps: float = 1e-9) -> List[float]:
+    grid = sorted(grid)
+    if not grid or not wins_gonf:
+        return []
+
+    def x_inside(w: WindowR, x: float) -> bool:
+        return (w.x + eps) < x < (w.x + w.w - eps)
+
+    def y_inside(w: WindowR, y: float) -> bool:
+        return (w.y_abs + eps) < y < (w.y_abs + w.h - eps)
+
+    def competitors_for_x(wA: WindowR) -> List[WindowR]:
+        out = []
+        Ay1, Ay2 = wA.y_abs, wA.y_abs + wA.h
+        for wB in wins_gonf:
+            if wB is wA:
+                continue
+            By1, By2 = wB.y_abs, wB.y_abs + wB.h
+            if _overlap_strict(Ay1, Ay2, By1, By2, eps=eps):
+                out.append(wB)
+        return out
+
+    def competitors_for_y(wA: WindowR) -> List[WindowR]:
+        out = []
+        Ax1, Ax2 = wA.x, wA.x + wA.w
+        for wB in wins_gonf:
+            if wB is wA:
+                continue
+            Bx1, Bx2 = wB.x, wB.x + wB.w
+            if _overlap_strict(Ax1, Ax2, Bx1, Bx2, eps=eps):
+                out.append(wB)
+        return out
+
+    extra: List[float] = []
+
+    for wA in wins_gonf:
+        if asse == "x":
+            L = wA.x
+            R = wA.x + wA.w
+            comps = competitors_for_x(wA)
+
+            i_sx = bisect.bisect_right(grid, L) - 1
+            while i_sx >= 0 and any(x_inside(wB, grid[i_sx]) for wB in comps):
+                i_sx -= 1
+            if i_sx >= 0:
+                extra.append(grid[i_sx])
+
+            i_dx = bisect.bisect_left(grid, R)
+            while i_dx < len(grid) and any(x_inside(wB, grid[i_dx]) for wB in comps):
+                i_dx += 1
+            if i_dx < len(grid):
+                extra.append(grid[i_dx])
+
+        else:
+            B = wA.y_abs
+            T = wA.y_abs + wA.h
+            comps = competitors_for_y(wA)
+
+            i_giu = bisect.bisect_right(grid, B) - 1
+            while i_giu >= 0 and any(y_inside(wB, grid[i_giu]) for wB in comps):
+                i_giu -= 1
+            if i_giu >= 0:
+                extra.append(grid[i_giu])
+
+            i_su = bisect.bisect_left(grid, T)
+            while i_su < len(grid) and any(y_inside(wB, grid[i_su]) for wB in comps):
+                i_su += 1
+            if i_su < len(grid):
+                extra.append(grid[i_su])
+
+    return sorted(set(extra))
+
+
+def inflate_window_clamped_to_panel(
+    w: WindowR,
+    i: int,
+    j: int,
+    cols: List[ColumnR],
+    beams: List[BeamR],
+    DISTF: float,
+    eps: float = 1e-9,
+) -> WindowR:
+    if DISTF <= 0:
+        return w
+
+    xmin = cols[j].x_axis + cols[j].spess / 2.0
+    xmax = cols[j + 1].x_axis - cols[j + 1].spess / 2.0
+    ymin = beams[i].y_axis + beams[i].spess / 2.0
+    ymax = beams[i + 1].y_axis - beams[i + 1].spess / 2.0
+
+    xa = w.x
+    ya = w.y_abs
+    xb = xa + w.w
+    yb = ya + w.h
+
+    pad_l = max(0.0, min(DISTF, xa - xmin))
+    pad_r = max(0.0, min(DISTF, xmax - xb))
+    pad_b = max(0.0, min(DISTF, ya - ymin))
+    pad_t = max(0.0, min(DISTF, ymax - yb))
+
+    if xa - pad_l < xmin - eps:
+        pad_l = max(0.0, xa - xmin)
+    if xb + pad_r > xmax + eps:
+        pad_r = max(0.0, xmax - xb)
+    if ya - pad_b < ymin - eps:
+        pad_b = max(0.0, ya - ymin)
+    if yb + pad_t > ymax + eps:
+        pad_t = max(0.0, ymax - yb)
+
+    return WindowR(
+        x=xa - pad_l,
+        y_rel=w.y_rel,
+        w=w.w + pad_l + pad_r,
+        h=w.h + pad_b + pad_t,
+        y_abs=ya - pad_b,
+    )
 
 
 # =========================================================
@@ -906,10 +1047,10 @@ def prune_dangling(edges, adj, protected_nodes):
     def degree(node):
         return sum(1 for eid in adj.get(node, set()) if alive[eid])
 
-    queue = [n for n in adj.keys() if degree(n) == 1 and n not in protected_nodes]
+    queue = deque([n for n in adj.keys() if degree(n) == 1 and n not in protected_nodes])
 
     while queue:
-        n = queue.pop(0)
+        n = queue.popleft()
         if n in protected_nodes:
             continue
         if degree(n) != 1:
@@ -1025,6 +1166,8 @@ def build_reinforcement_for_facade(
             "Ybase": [],
             "Xsec": [],
             "Ysec": [],
+            "Xfin": [],
+            "Yfin": [],
             "v_segs": [],
             "h_segs": [],
             "d_segs": [],
@@ -1033,43 +1176,90 @@ def build_reinforcement_for_facade(
             "d_full": [],
         }
 
-    _, Xbase = primarie(cols, vertical=True, PASSO=PASSO_BASE_CM, CLEAR=clear_cm)
+    Xfull, Xbase = primarie(cols, vertical=True, PASSO=PASSO_BASE_CM, CLEAR=clear_cm)
 
     if forced_Ybase is None:
-        _, Ybase = primarie(beams, vertical=False, PASSO=PASSO_BASE_CM, CLEAR=clear_cm)
+        Yfull, Ybase = primarie(beams, vertical=False, PASSO=PASSO_BASE_CM, CLEAR=clear_cm)
     else:
         Ybase = sorted(set(float(y) for y in forced_Ybase))
+        Yfull = Ybase[:]
 
-    Xsec = intermedie(sorted(set(Xbase)), PASSO=PASSO_BASE_CM, possible_steps=possible_steps_cm)
-    Ysec = intermedie(sorted(set(Ybase)), PASSO=PASSO_BASE_CM, possible_steps=possible_steps_cm)
+    win_data_by_panel: Dict[Tuple[int, int], List[WindowR]] = defaultdict(list)
+    if windows:
+        for i in range(len(beams) - 1):
+            for j in range(len(cols) - 1):
+                panel_x1 = cols[j].x_axis
+                panel_x2 = cols[j + 1].x_axis
+                panel_y1 = beams[i].y_axis
+                panel_y2 = beams[i + 1].y_axis
 
-    Xall = sorted(set(Xbase + Xsec))
-    Yall = sorted(set(Ybase + Ysec))
+                panel_windows = []
+                for w in windows:
+                    a = opening_overlap_area_cm2(panel_x1, panel_x2, panel_y1, panel_y2, w)
+                    if a > 0:
+                        panel_windows.append(w)
+                if panel_windows:
+                    win_data_by_panel[(i, j)] = panel_windows
 
-    windows_infl = []
-    for w in windows:
-        windows_infl.append(
-            WindowR(
-                x=w.x - distf_cm,
-                y_rel=w.y_rel,
-                w=w.w + 2 * distf_cm,
-                h=w.h + 2 * distf_cm,
-                y_abs=w.y_abs - distf_cm,
+    all_w_infl: List[WindowR] = []
+    infl_by_panel: Dict[Tuple[int, int], List[WindowR]] = defaultdict(list)
+
+    for (i, j), lst in win_data_by_panel.items():
+        for w in lst:
+            wi = inflate_window_clamped_to_panel(
+                w=w,
+                i=i,
+                j=j,
+                cols=cols,
+                beams=beams,
+                DISTF=distf_cm,
             )
-        )
+            infl_by_panel[(i, j)].append(wi)
+            all_w_infl.append(wi)
+
+    Xfin_all: List[float] = []
+    Yfin_all: List[float] = []
+
+    for (_ij, wins_panel) in infl_by_panel.items():
+        if wins_panel:
+            Xfin_all.extend(linee_finestre_candidate_driven(Xfull, wins_panel, "x"))
+            Yfin_all.extend(linee_finestre_candidate_driven(Yfull, wins_panel, "y"))
+
+    Xfin = sorted(set(Xfin_all))
+    Yfin = sorted(set(Yfin_all))
+
+    EPSG = 1e-6
+
+    def _inside_any_column_inclusive(x: float) -> bool:
+        return any(abs(x - c.x_axis) <= (c.spess / 2 + EPSG) for c in cols)
+
+    def _inside_any_beam_inclusive(y: float) -> bool:
+        return any(abs(y - b.y_axis) <= (b.spess / 2 + EPSG) for b in beams)
+
+    Xfin = [x for x in Xfin if not _inside_any_column_inclusive(x)]
+    Yfin = [y for y in Yfin if not _inside_any_beam_inclusive(y)]
+
+    Xsec = intermedie(sorted(set(Xbase + Xfin)), PASSO=PASSO_BASE_CM, possible_steps=possible_steps_cm)
+    Ysec = intermedie(sorted(set(Ybase + Yfin)), PASSO=PASSO_BASE_CM, possible_steps=possible_steps_cm)
+
+    Xsec = [x for x in Xsec if not _inside_any_column_inclusive(x)]
+    Ysec = [y for y in Ysec if not _inside_any_beam_inclusive(y)]
+
+    Xall = sorted(set(Xbase + Xfin + Xsec))
+    Yall = sorted(set(Ybase + Yfin + Ysec))
 
     v_raw = []
     h_raw = []
 
     for y in Yall:
         for x1, x2 in zip(Xall[:-1], Xall[1:]):
-            for xa, xb in clip_horizontal_segment(y, x1, x2, windows_infl, DISTF=0):
+            for xa, xb in clip_horizontal_segment(y, x1, x2, all_w_infl, DISTF=0):
                 if xb > xa:
                     h_raw.append((y, xa, xb))
 
     for x in Xall:
         for y1, y2 in zip(Yall[:-1], Yall[1:]):
-            for ya, yb in clip_vertical_segment(x, y1, y2, windows_infl, DISTF=0):
+            for ya, yb in clip_vertical_segment(x, y1, y2, all_w_infl, DISTF=0):
                 if yb > ya:
                     v_raw.append((x, ya, yb))
 
@@ -1081,9 +1271,9 @@ def build_reinforcement_for_facade(
             a, b = Xall[i], Xall[i + 1]
             c, d = Yall[j], Yall[j + 1]
 
-            if ok_seg(a, c, b, d, windows_infl, DISTF=0):
+            if ok_seg(a, c, b, d, all_w_infl, DISTF=0):
                 d_segs.append((a, c, b, d))
-            if ok_seg(a, d, b, c, windows_infl, DISTF=0):
+            if ok_seg(a, d, b, c, all_w_infl, DISTF=0):
                 d_segs.append((a, d, b, c))
 
     v_full = []
@@ -1115,6 +1305,8 @@ def build_reinforcement_for_facade(
         "Ybase": Ybase,
         "Xsec": Xsec,
         "Ysec": Ysec,
+        "Xfin": Xfin,
+        "Yfin": Yfin,
         "v_segs": v_segs,
         "h_segs": h_segs,
         "d_segs": d_segs,
@@ -1472,7 +1664,13 @@ def convert_real_force_to_sdf(Fy_real_kN: float, gamma: float, mstar_ton: float)
 # =========================================================
 # CALCOLO SISTEMA SU 4 DIREZIONI
 # =========================================================
-def evaluate_system_4dirs(geometry: Dict[str, Any], modal: Dict[str, Any], deltaK_targets: Dict[str, float], df_real_panels: List[Dict[str, Any]], diag_key: str):
+def evaluate_system_4dirs(
+    geometry: Dict[str, Any],
+    modal: Dict[str, Any],
+    deltaK_targets: Dict[str, float],
+    df_real_panels: List[Dict[str, Any]],
+    diag_key: str
+):
     directions = ["+X", "-X", "+Y", "-Y"]
     out = {}
 
@@ -1942,7 +2140,7 @@ def health():
     return {
         "status": "ok",
         "service": "muratura-reinforcement-api",
-        "version": "1.0.0",
+        "version": "1.1.0",
     }
 
 
