@@ -1654,7 +1654,13 @@ def direction_to_axis_and_branch(direction: str) -> Tuple[str, str]:
 # =========================================================
 # AGGREGAZIONE MDOF
 # =========================================================
-def build_directional_panel_dataframe(df_panels: List[Dict[str, Any]], geometry: Dict[str, Any], direction: str, diag_key: str):
+
+def build_directional_panel_dataframe(
+    df_panels: List[Dict[str, Any]],
+    geometry: Dict[str, Any],
+    direction: str,
+    diag_key: str
+):
     axis, branch = direction_to_axis_and_branch(direction)
     facades_by_idx = {f["index"]: f for f in geometry["facades"]}
     rows = []
@@ -1676,10 +1682,17 @@ def build_directional_panel_dataframe(df_panels: List[Dict[str, Any]], geometry:
         )
 
         ramo = bil["positivo"] if branch == "POSITIVO" else bil["negativo"]
+
         Fy_loc_kN = abs(float(ramo["Fy_ratio_kN"]))
         dHy_mm = abs(float(ramo["dH_y_ratio_mm"]))
         K_loc_kNmm = Fy_loc_kN / dHy_mm if dHy_mm > EPS else 0.0
         K_loc_Nmm = K_loc_kNmm * 1000.0
+
+        (tx, ty), (_nx, _ny) = get_facade_unit_vectors(facade)
+        if axis == "X":
+            c = abs(tx)
+        else:
+            c = abs(ty)
 
         K_dir, Fy_dir = project_local_panel_to_global_direction(
             K_local_Nmm=K_loc_Nmm,
@@ -1697,6 +1710,13 @@ def build_directional_panel_dataframe(df_panels: List[Dict[str, Any]], geometry:
             "Campata": int(row["Campata"]),
             "FrameKey": frame_key,
             "Direction": direction,
+            "Axis": axis,
+            "tx": tx,
+            "ty": ty,
+            "c_dir": c,
+            "K_panel_local [kN/mm]": K_loc_kNmm,
+            "K_panel_local [N/mm]": K_loc_Nmm,
+            "Fy_panel_local [kN]": Fy_loc_kN,
             "K_panel_dir [N/mm]": K_dir,
             "Fy_panel_dir [kN]": Fy_dir,
         })
@@ -2360,8 +2380,12 @@ def build_panel_summary_rows(
     for row in panels_rows:
         H_cm = float(row["H [cm]"])
         B_cm = float(row["B [cm]"])
+        mx_cm = float(row["mx [cm]"])
+        my_cm = float(row["my [cm]"])
         Pm_cm = float(row["Pm [cm]"])
         ratio = float(row["ratio"])
+        p_d_mm = Pm_cm * 10.0
+        H_over_B = H_cm / B_cm if abs(B_cm) > EPS else 0.0
 
         bil = build_bilinear_for_panel(
             H_cm=H_cm,
@@ -2379,11 +2403,19 @@ def build_panel_summary_rows(
             "Facciata": row["Facciata"],
             "Piano": row["Piano"],
             "Campata": row["Campata"],
+
+            "B_cm": B_cm,
+            "H_cm": H_cm,
+            "mx_cm": mx_cm,
+            "my_cm": my_cm,
             "Pm_cm": Pm_cm,
+            "p_d_mm": p_d_mm,
+            "H_over_B": H_over_B,
             "ratio": ratio,
 
             "Kel_pos_kNmm": float(pos["Kel_ratio_kNmm"]),
             "Fh_y_pos_kN": float(pos["Fy_ratio_kN"]),
+            "dHy_teo_pos_mm": float(pos["dH_y_theoretical_mm"]),
             "dHy_pos_mm": float(pos["dH_y_ratio_mm"]),
             "dHu_pos_mm": float(pos["dH_u_ratio_mm"]),
             "Kel_eq_pos_kNmm": float(pos["Kel_eq_ratio_kNmm"]),
@@ -2391,6 +2423,7 @@ def build_panel_summary_rows(
 
             "Kel_neg_kNmm": float(neg["Kel_ratio_kNmm"]),
             "Fh_y_neg_kN": float(neg["Fy_ratio_kN"]),
+            "dHy_teo_neg_mm": float(neg["dH_y_theoretical_mm"]),
             "dHy_neg_mm": float(neg["dH_y_ratio_mm"]),
             "dHu_neg_mm": float(neg["dH_u_ratio_mm"]),
             "Kel_eq_neg_kNmm": float(neg["Kel_eq_ratio_kNmm"]),
@@ -2401,16 +2434,20 @@ def build_panel_summary_rows(
         })
     return out
 
+
 def combine_directional_panels_series_parallel_detailed(df_dir_panels: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not df_dir_panels:
         return {
             "K_MDOF [N/mm]": 0.0,
             "Fy_MDOF [kN]": 0.0,
+            "panel_dir_rows": [],
             "floor_rows": [],
             "frameK_rows": [],
             "bay_rows": [],
             "frameF_rows": [],
         }
+
+    panel_dir_rows = list(df_dir_panels)
 
     floor_group = defaultdict(list)
     for row in df_dir_panels:
@@ -2469,12 +2506,12 @@ def combine_directional_panels_series_parallel_detailed(df_dir_panels: List[Dict
     return {
         "K_MDOF [N/mm]": float(K_R),
         "Fy_MDOF [kN]": float(Fy_R),
+        "panel_dir_rows": panel_dir_rows,
         "floor_rows": floor_rows,
         "frameK_rows": frameK_rows,
         "bay_rows": bay_rows,
         "frameF_rows": frameF_rows,
     }
-
 
 def build_directional_report_data(
     geometry: Dict[str, Any],
@@ -2496,7 +2533,8 @@ def build_directional_report_data(
         )
         comb = combine_directional_panels_series_parallel_detailed(df_dir)
 
-        deltaK_real_kNmm = comb["K_MDOF [N/mm]"] / 1000.0
+        K_MDOF_Nmm = comb["K_MDOF [N/mm]"]
+        deltaK_real_kNmm = K_MDOF_Nmm / 1000.0
         Fy_MDOF = comb["Fy_MDOF [kN]"]
 
         gamma = float(modal[axis]["gamma"])
@@ -2507,12 +2545,16 @@ def build_directional_report_data(
 
         out[direction] = {
             "axis": axis,
+            "gamma": gamma,
+            "Mstar_ton": mstar_ton,
             "target_deltaK": target,
+            "K_MDOF_Nmm": K_MDOF_Nmm,
             "deltaK_real_MDOF": deltaK_real_kNmm,
             "Fy_MDOF": Fy_MDOF,
             "deltaK_1GDL_g_per_mm": convert_real_deltaK_to_sdf(deltaK_real_kNmm, gamma, mstar_ton),
             "Se_g": convert_real_force_to_sdf(Fy_MDOF, gamma, mstar_ton)["Se_g"],
             "verificato": bool(verifica),
+            "panel_dir_rows": comb["panel_dir_rows"],
             "floor_rows": comb["floor_rows"],
             "frameK_rows": comb["frameK_rows"],
             "bay_rows": comb["bay_rows"],
@@ -2520,6 +2562,83 @@ def build_directional_report_data(
         }
     return out
 
+
+def render_formula_page(c: canvas.Canvas, W, H, subtitle_lines: List[str]):
+    _header_pdf(c, W, H, "Formule di controllo manuale", subtitle_lines)
+
+    y = H - 2.4 * cm
+    c.setFont(FONT_BOLD, 11)
+    c.drawString(1.2 * cm, y, "1) Parametri pannello")
+    y -= 0.45 * cm
+    c.setFont(FONT_REG, 9)
+    c.drawString(1.4 * cm, y, "p_d [mm] = Pm [cm] x 10")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "H/B = H [cm] / B [cm]")
+
+    y -= 0.55 * cm
+    c.setFont(FONT_BOLD, 11)
+    c.drawString(1.2 * cm, y, "2) Formule bilineari")
+    y -= 0.45 * cm
+    c.setFont(FONT_REG, 9)
+    c.drawString(1.4 * cm, y, "Kel = a_s x p_d^(b_s) x (H/B)^(c_s)")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "Fh_y/Hd = a_s x p_d^(b_s) x (H/B)^(c_s)")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "dHu/Hd = a_s x p_d^(b_s) x (H/B)^(c_s)")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "Fy = (Fh_y/Hd) x H_mm")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "dHu = (dHu/Hd) x H_mm")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "dHy_teorico = Fy / Kel")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "Se dHy_teorico > dHu, si assume dHy = dHu e Kel_eq = Kel")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "Altrimenti dHy = dHy_teorico e Kel_eq = Fy / dHu")
+
+    y -= 0.55 * cm
+    c.setFont(FONT_BOLD, 11)
+    c.drawString(1.2 * cm, y, "3) Proiezione sulla direzione globale")
+    y -= 0.45 * cm
+    c.setFont(FONT_REG, 9)
+    c.drawString(1.4 * cm, y, "Per asse X: c = |tx|")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "Per asse Y: c = |ty|")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "K_dir = K_local x c^2")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "Fy_dir = Fy_local x c")
+
+    y -= 0.55 * cm
+    c.setFont(FONT_BOLD, 11)
+    c.drawString(1.2 * cm, y, "4) Aggregazioni")
+    y -= 0.45 * cm
+    c.setFont(FONT_REG, 9)
+    c.drawString(1.4 * cm, y, "Per piano: K_floor = somma(K_panel_dir)")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "Per frame in altezza: 1/K_frame = somma(1/K_floor)")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "Globale rigidezza: K_MDOF = somma(K_frame)")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "Per campata: Fy_bay = media(Fy_panel_dir)")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "Per frame: Fy_frame = somma(Fy_bay)")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "Globale resistenza: Fy_MDOF = somma(Fy_frame)")
+
+    y -= 0.55 * cm
+    c.setFont(FONT_BOLD, 11)
+    c.drawString(1.2 * cm, y, "5) Conversioni finali")
+    y -= 0.45 * cm
+    c.setFont(FONT_REG, 9)
+    c.drawString(1.4 * cm, y, "deltaK_real_MDOF [kN/mm] = K_MDOF [N/mm] / 1000")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "k_1GDL [g/mm] = deltaK_real_MDOF / (Mstar_ton x g x gamma)")
+    y -= 0.38 * cm
+    c.drawString(1.4 * cm, y, "Se(Fy) [g] = Fy_MDOF / (gamma x Mstar_ton x g)")
+
+    _footer_pdf(c, W, H)
+    c.showPage()
 
 def render_pdf_report(
     pdf_path: Path,
@@ -2536,6 +2655,8 @@ def render_pdf_report(
         f"Sistema scelto: famiglia {best_system['famiglia']} | diagonale {best_system['diagonale']}",
         "Report automatico rinforzo tamponamenti",
     ]
+
+    render_formula_page(c, W, H, subtitle_lines)
 
     # -----------------------------------------------------------------
     # PAGINE FACCIATE - 2 PER PAGINA
@@ -2583,65 +2704,49 @@ def render_pdf_report(
         c.showPage()
 
     # -----------------------------------------------------------------
-    # PAGINE RIASSUNTO TAMPONAMENTI
+    # PAGINA 1 TABELLA GEOMETRICA TAMPONAMENTI
     # -----------------------------------------------------------------
-    _header_pdf(c, W, H, "Riepilogo tamponamento per tamponamento", subtitle_lines)
-    c.setFont(FONT_REG, 8.5)
-    y_note = H - 1.95 * cm
-    c.drawString(0.9 * cm, y_note, "Nota: se dHy teorico > dHu, il modello viene troncato a dHu e si assume Kel_eq = Kel.")
-    c.setFont(FONT_BOLD, 8.2)
-    y = H - 2.3 * cm
+    _header_pdf(c, W, H, "Tabella geometrica tamponamenti", subtitle_lines)
+    c.setFont(FONT_BOLD, 7.8)
+    y = H - 2.2 * cm
 
-    headers = [
-        "Tag", "Pm",
-        "Kel +", "Fh_y +", "dHy +", "dHu +", "Kel_eq +",
-        "Kel -", "Fh_y -", "dHy -", "dHu -", "Kel_eq -"
-    ]
-    xs = [
-        0.7*cm, 3.4*cm,
-        4.6*cm, 6.0*cm, 7.4*cm, 8.6*cm, 9.8*cm,
-        11.3*cm, 12.7*cm, 14.1*cm, 15.3*cm, 16.5*cm
-    ]
+    headers = ["Tag", "B [cm]", "H [cm]", "mx [cm]", "my [cm]", "Pm [cm]", "p_d [mm]", "H/B", "ratio"]
+    xs = [0.8*cm, 3.9*cm, 5.4*cm, 6.9*cm, 8.4*cm, 9.9*cm, 11.5*cm, 13.4*cm, 15.0*cm]
 
     for xx, hh in zip(xs, headers):
         c.drawString(xx, y, hh)
 
     y -= 0.30 * cm
-    c.line(0.6 * cm, y, W - 0.6 * cm, y)
+    c.line(0.7 * cm, y, W - 0.7 * cm, y)
     y -= 0.28 * cm
-    c.setFont(FONT_REG, 7.0)
+    c.setFont(FONT_REG, 7.1)
 
     for row in panel_summary_rows:
         if y < 1.8 * cm:
             _footer_pdf(c, W, H)
             c.showPage()
-            _header_pdf(c, W, H, "Riepilogo tamponamento per tamponamento", subtitle_lines)
-            c.setFont(FONT_BOLD, 8.2)
-            y = H - 2.3 * cm
+            _header_pdf(c, W, H, "Tabella geometrica tamponamenti", subtitle_lines)
+            c.setFont(FONT_BOLD, 7.8)
+            y = H - 2.2 * cm
 
             for xx, hh in zip(xs, headers):
                 c.drawString(xx, y, hh)
 
             y -= 0.30 * cm
-            c.line(0.6 * cm, y, W - 0.6 * cm, y)
+            c.line(0.7 * cm, y, W - 0.7 * cm, y)
             y -= 0.28 * cm
-            c.setFont(FONT_REG, 7.0)
+            c.setFont(FONT_REG, 7.1)
 
         vals = [
             row["Tamponamento"],
+            f"{row['B_cm']:.1f}",
+            f"{row['H_cm']:.1f}",
+            f"{row['mx_cm']:.1f}",
+            f"{row['my_cm']:.1f}",
             f"{row['Pm_cm']:.1f}",
-
-            f"{row['Kel_pos_kNmm']:.1f}",
-            f"{row['Fh_y_pos_kN']:.1f}",
-            f"{row['dHy_pos_mm']:.1f}",
-            f"{row['dHu_pos_mm']:.1f}",
-            f"{row['Kel_eq_pos_kNmm']:.3f}",
-
-            f"{row['Kel_neg_kNmm']:.1f}",
-            f"{row['Fh_y_neg_kN']:.1f}",
-            f"{row['dHy_neg_mm']:.1f}",
-            f"{row['dHu_neg_mm']:.1f}",
-            f"{row['Kel_eq_neg_kNmm']:.3f}",
+            f"{row['p_d_mm']:.1f}",
+            f"{row['H_over_B']:.3f}",
+            f"{row['ratio']:.3f}",
         ]
 
         for xx, vv in zip(xs, vals):
@@ -2653,17 +2758,151 @@ def render_pdf_report(
     c.showPage()
 
     # -----------------------------------------------------------------
+    # PAGINA 2 TABELLA MECCANICA TAMPONAMENTI
+    # -----------------------------------------------------------------
+    _header_pdf(c, W, H, "Tabella meccanica tamponamenti", subtitle_lines)
+    c.setFont(FONT_REG, 8.2)
+    y_note = H - 1.95 * cm
+    c.drawString(0.9 * cm, y_note, "Nota: se dHy teorico > dHu, il modello viene troncato a dHu e si assume Kel_eq = Kel.")
+    c.setFont(FONT_BOLD, 6.7)
+    y = H - 2.25 * cm
+
+    headers = [
+        "Tag",
+        "Kel +", "Fh_y +", "dHy teo +", "dHy +", "dHu +", "Kel_eq +", "Tronc +",
+        "Kel -", "Fh_y -", "dHy teo -", "dHy -", "dHu -", "Kel_eq -", "Tronc -"
+    ]
+    xs = [
+        0.35*cm,
+        2.8*cm, 4.0*cm, 5.2*cm, 6.5*cm, 7.6*cm, 8.7*cm, 10.0*cm,
+        11.0*cm, 12.2*cm, 13.4*cm, 14.7*cm, 15.8*cm, 16.9*cm, 18.0*cm
+    ]
+
+    for xx, hh in zip(xs, headers):
+        c.drawString(xx, y, hh)
+
+    y -= 0.28 * cm
+    c.line(0.3 * cm, y, W - 0.3 * cm, y)
+    y -= 0.24 * cm
+    c.setFont(FONT_REG, 6.0)
+
+    for row in panel_summary_rows:
+        if y < 1.8 * cm:
+            _footer_pdf(c, W, H)
+            c.showPage()
+            _header_pdf(c, W, H, "Tabella meccanica tamponamenti", subtitle_lines)
+            c.setFont(FONT_REG, 8.2)
+            y_note = H - 1.95 * cm
+            c.drawString(0.9 * cm, y_note, "Nota: se dHy teorico > dHu, il modello viene troncato a dHu e si assume Kel_eq = Kel.")
+            c.setFont(FONT_BOLD, 6.7)
+            y = H - 2.25 * cm
+
+            for xx, hh in zip(xs, headers):
+                c.drawString(xx, y, hh)
+
+            y -= 0.28 * cm
+            c.line(0.3 * cm, y, W - 0.3 * cm, y)
+            y -= 0.24 * cm
+            c.setFont(FONT_REG, 6.0)
+
+        vals = [
+            row["Tamponamento"],
+            f"{row['Kel_pos_kNmm']:.1f}",
+            f"{row['Fh_y_pos_kN']:.1f}",
+            f"{row['dHy_teo_pos_mm']:.1f}",
+            f"{row['dHy_pos_mm']:.1f}",
+            f"{row['dHu_pos_mm']:.1f}",
+            f"{row['Kel_eq_pos_kNmm']:.3f}",
+            "SI" if row["trunc_pos"] else "NO",
+            f"{row['Kel_neg_kNmm']:.1f}",
+            f"{row['Fh_y_neg_kN']:.1f}",
+            f"{row['dHy_teo_neg_mm']:.1f}",
+            f"{row['dHy_neg_mm']:.1f}",
+            f"{row['dHu_neg_mm']:.1f}",
+            f"{row['Kel_eq_neg_kNmm']:.3f}",
+            "SI" if row["trunc_neg"] else "NO",
+        ]
+
+        for xx, vv in zip(xs, vals):
+            c.drawString(xx, y, vv)
+
+        y -= 0.24 * cm
+
+    _footer_pdf(c, W, H)
+    c.showPage()
+
+    # -----------------------------------------------------------------
     # PAGINE DIREZIONALI
     # -----------------------------------------------------------------
     for direction in ["+X", "-X", "+Y", "-Y"]:
         dd = directional_report[direction]
-        _header_pdf(c, W, H, f"Direzione {direction}", subtitle_lines)
+
+        # -------------------------------------------------------------
+        # PAGINA 1: CONTRIBUTI DEI SINGOLI PANNELLI
+        # -------------------------------------------------------------
+        _header_pdf(c, W, H, f"Direzione {direction} - Contributi pannello", subtitle_lines)
+
+        panel_headers = ["Tag", "F", "P", "C", "Frame", "tx", "ty", "c", "Kloc", "FyLoc", "Kdir", "FyDir"]
+        panel_xs = [0.4*cm, 2.9*cm, 3.4*cm, 3.9*cm, 4.4*cm, 6.0*cm, 7.0*cm, 8.0*cm, 9.0*cm, 10.5*cm, 12.2*cm, 14.4*cm]
+
+        c.setFont(FONT_BOLD, 7.0)
+        y = H - 2.2 * cm
+        for xx, hh in zip(panel_xs, panel_headers):
+            c.drawString(xx, y, hh)
+
+        y -= 0.28 * cm
+        c.line(0.3 * cm, y, W - 0.3 * cm, y)
+        y -= 0.24 * cm
+        c.setFont(FONT_REG, 6.0)
+
+        for rr in dd["panel_dir_rows"]:
+            if y < 1.8 * cm:
+                _footer_pdf(c, W, H)
+                c.showPage()
+                _header_pdf(c, W, H, f"Direzione {direction} - Contributi pannello", subtitle_lines)
+                c.setFont(FONT_BOLD, 7.0)
+                y = H - 2.2 * cm
+                for xx, hh in zip(panel_xs, panel_headers):
+                    c.drawString(xx, y, hh)
+                y -= 0.28 * cm
+                c.line(0.3 * cm, y, W - 0.3 * cm, y)
+                y -= 0.24 * cm
+                c.setFont(FONT_REG, 6.0)
+
+            vals = [
+                rr["Tamponamento"],
+                f"{rr['Facciata']}",
+                f"{rr['Piano']}",
+                f"{rr['Campata']}",
+                f"{rr['FrameKey']}",
+                f"{rr['tx']:.3f}",
+                f"{rr['ty']:.3f}",
+                f"{rr['c_dir']:.3f}",
+                f"{rr['K_panel_local [kN/mm]']:.3f}",
+                f"{rr['Fy_panel_local [kN]']:.3f}",
+                f"{rr['K_panel_dir [N/mm]']:.3f}",
+                f"{rr['Fy_panel_dir [kN]']:.3f}",
+            ]
+
+            for xx, vv in zip(panel_xs, vals):
+                c.drawString(xx, y, vv)
+
+            y -= 0.24 * cm
+
+        _footer_pdf(c, W, H)
+        c.showPage()
+
+        # -------------------------------------------------------------
+        # PAGINA 2: AGGREGAZIONI
+        # -------------------------------------------------------------
+        _header_pdf(c, W, H, f"Direzione {direction} - Aggregazioni", subtitle_lines)
 
         y = H - 2.3 * cm
         c.setFont(FONT_BOLD, 11)
         c.drawString(1.2 * cm, y, "Combinazioni in parallelo per piano")
         y -= 0.45 * cm
         c.setFont(FONT_REG, 9)
+
         for rr in dd["floor_rows"]:
             txt = (
                 f"Frame {rr['FrameKey']} | Piano {rr['Piano']} | "
@@ -2673,9 +2912,9 @@ def render_pdf_report(
             if y < 2.0 * cm:
                 _footer_pdf(c, W, H)
                 c.showPage()
-                _header_pdf(c, W, H, f"Direzione {direction}", subtitle_lines)
+                _header_pdf(c, W, H, f"Direzione {direction} - Aggregazioni", subtitle_lines)
                 y = H - 2.3 * cm
-            c.drawString(1.2 * cm, y, txt[:140])
+            c.drawString(1.2 * cm, y, txt[:145])
             y -= 0.38 * cm
 
         y -= 0.20 * cm
@@ -2683,12 +2922,13 @@ def render_pdf_report(
         c.drawString(1.2 * cm, y, "Combinazioni in serie dei frame")
         y -= 0.45 * cm
         c.setFont(FONT_REG, 9)
+
         for rr in dd["frameK_rows"]:
             txt = f"Frame {rr['FrameKey']} | K_frame = {rr['K_frame [N/mm]']:.2f} N/mm"
             if y < 2.0 * cm:
                 _footer_pdf(c, W, H)
                 c.showPage()
-                _header_pdf(c, W, H, f"Direzione {direction}", subtitle_lines)
+                _header_pdf(c, W, H, f"Direzione {direction} - Aggregazioni", subtitle_lines)
                 y = H - 2.3 * cm
             c.drawString(1.2 * cm, y, txt)
             y -= 0.38 * cm
@@ -2698,12 +2938,13 @@ def render_pdf_report(
         c.drawString(1.2 * cm, y, "Resistenze per campata e frame")
         y -= 0.45 * cm
         c.setFont(FONT_REG, 9)
+
         for rr in dd["bay_rows"]:
             txt = f"Frame {rr['FrameKey']} | Campata {rr['Campata']} | Fy_bay_mean = {rr['Fy_bay_mean [kN]']:.2f} kN"
             if y < 2.0 * cm:
                 _footer_pdf(c, W, H)
                 c.showPage()
-                _header_pdf(c, W, H, f"Direzione {direction}", subtitle_lines)
+                _header_pdf(c, W, H, f"Direzione {direction} - Aggregazioni", subtitle_lines)
                 y = H - 2.3 * cm
             c.drawString(1.2 * cm, y, txt)
             y -= 0.38 * cm
@@ -2713,19 +2954,43 @@ def render_pdf_report(
             if y < 2.0 * cm:
                 _footer_pdf(c, W, H)
                 c.showPage()
-                _header_pdf(c, W, H, f"Direzione {direction}", subtitle_lines)
+                _header_pdf(c, W, H, f"Direzione {direction} - Aggregazioni", subtitle_lines)
                 y = H - 2.3 * cm
             c.drawString(1.2 * cm, y, txt)
             y -= 0.38 * cm
 
-        y -= 0.35 * cm
+        _footer_pdf(c, W, H)
+        c.showPage()
+
+        # -------------------------------------------------------------
+        # PAGINA 3: RIEPILOGO FINALE DIREZIONE
+        # -------------------------------------------------------------
+        _header_pdf(c, W, H, f"Direzione {direction} - Riepilogo finale", subtitle_lines)
+
+        y = H - 2.5 * cm
         c.setFont(FONT_BOLD, 11)
-        c.drawString(1.2 * cm, y, f"Delta_K richiesto = {dd['target_deltaK']:.3f} kN/mm")
-        y -= 0.45 * cm
-        c.drawString(1.2 * cm, y, f"Delta_K ottenuto = {dd['deltaK_real_MDOF']:.3f} kN/mm")
-        y -= 0.45 * cm
-        c.drawString(1.2 * cm, y, f"Fy ottenuto = {dd['Fy_MDOF']:.3f} kN")
-        y -= 0.45 * cm
+        c.drawString(1.2 * cm, y, f"Asse di riferimento = {dd['axis']}")
+        y -= 0.55 * cm
+        c.drawString(1.2 * cm, y, f"gamma = {dd['gamma']:.6f}")
+        y -= 0.55 * cm
+        c.drawString(1.2 * cm, y, f"Mstar = {dd['Mstar_ton']:.6f} ton")
+        y -= 0.55 * cm
+        c.drawString(1.2 * cm, y, f"K_MDOF = {dd['K_MDOF_Nmm']:.6f} N/mm")
+        y -= 0.55 * cm
+        c.drawString(1.2 * cm, y, f"Delta_K richiesto = {dd['target_deltaK']:.6f} kN/mm")
+        y -= 0.55 * cm
+        c.drawString(1.2 * cm, y, f"Delta_K ottenuto = {dd['deltaK_real_MDOF']:.6f} kN/mm")
+        y -= 0.55 * cm
+        c.drawString(1.2 * cm, y, f"k_1GDL = {dd['deltaK_1GDL_g_per_mm']:.8f} g/mm")
+        y -= 0.55 * cm
+        c.drawString(1.2 * cm, y, f"Fy_MDOF = {dd['Fy_MDOF']:.6f} kN")
+        y -= 0.55 * cm
+        c.drawString(1.2 * cm, y, f"Se(Fy) = {dd['Se_g']:.8f} g")
+        y -= 0.55 * cm
+        c.drawString(1.2 * cm, y, "k_1GDL = Delta_K / (Mstar x g x gamma)")
+        y -= 0.55 * cm
+        c.drawString(1.2 * cm, y, "Se(Fy) = Fy_MDOF / (gamma x Mstar x g)")
+        y -= 0.55 * cm
         c.drawString(1.2 * cm, y, f"Esito = {'VERIFICATO' if dd['verificato'] else 'NON VERIFICATO'}")
 
         _footer_pdf(c, W, H)
